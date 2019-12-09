@@ -67,7 +67,7 @@ func scanPostInto(row *sql.Row, v *Post, fct facet) error {
 	case contentFacet:
 		return row.Scan(&v.Title, &v.Body, &v.Music)
 	default:
-		panic("Post does not support facet " + fct.String())
+		panic("foos.Post does not support facet " + fct.String())
 	}
 }
 
@@ -86,7 +86,7 @@ func scanNextPostInto(rows *sql.Rows, v *Post, fct facet) error {
 	case contentFacet:
 		return rows.Scan(&v.Title, &v.Body, &v.Music)
 	default:
-		panic("Post does not support facet " + fct.String())
+		panic("foos.Post does not support facet " + fct.String())
 	}
 }
 
@@ -140,7 +140,7 @@ func addPostFields(s sqlexpr.Fieldable, fct facet) {
 		s.AddField(sqlexpr.Column("description"))
 		s.AddField(sqlexpr.Column("music"))
 	default:
-		panic("Post does not support facet " + fct.String())
+		panic("foos.Post does not support facet " + fct.String())
 	}
 }
 
@@ -181,7 +181,7 @@ func addPostSetters(s sqlexpr.Settable, v *Post, fct facet) {
 		s.Set(sqlexpr.Column("description"), v.Body)
 		s.Set(sqlexpr.Column("music"), v.Music)
 	default:
-		panic("Post does not support facet " + fct.String())
+		panic("foos.Post does not support facet " + fct.String())
 	}
 }
 
@@ -222,7 +222,7 @@ func addPostConditions(s sqlexpr.Whereable, v *Post, fct facet) {
 		s.AddWhere(sqlexpr.Eq(sqlexpr.Column("description"), v.Body))
 		s.AddWhere(sqlexpr.Eq(sqlexpr.Column("music"), v.Music))
 	default:
-		panic("Post does not support facet " + fct.String())
+		panic("foos.Post does not support facet " + fct.String())
 	}
 }
 

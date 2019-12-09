@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"golang.org/x/tools/go/packages"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -26,9 +27,6 @@ type Logger interface {
 }
 
 type Options struct {
-	InputFileName string
-	InputPkgName  string
-
 	PkgName string
 
 	Published bool
@@ -40,10 +38,13 @@ type Options struct {
 type generator struct {
 	log Logger
 
-	inPkg string
+	outPkgName       string
+	currentInPkgName string
 
 	published bool
 	types     map[string]Type
+
+	nullStrategies map[string]CodingStrategy
 
 	persistentStructs []*Struct
 
@@ -53,94 +54,160 @@ type generator struct {
 	noneFacetIdent string
 }
 
-func Generate(src []byte, opt Options) ([]byte, error) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, opt.InputFileName, src, parser.ParseComments)
+func newGenerator(opt Options) *generator {
+	g := &generator{
+		log:        opt.Logger,
+		published:  opt.Published,
+		outPkgName: opt.PkgName,
+
+		types:  make(map[string]Type),
+		facets: make(map[string]*Facet),
+
+		nullStrategies: make(map[string]CodingStrategy),
+	}
+	g.initBuiltInTypes()
+	return g
+}
+
+func GeneratePkg(pkgPatterns []string, opt Options) ([]byte, error) {
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes,
+	}, pkgPatterns...)
 	if err != nil {
 		return nil, err
 	}
 
-	if opt.PkgName == "" {
-		opt.PkgName = file.Name.Name
-	}
-
-	g := &generator{
-		log:       opt.Logger,
-		published: opt.Published,
-		inPkg:     opt.InputPkgName,
-
-		types:  make(map[string]Type),
-		facets: make(map[string]*Facet),
-	}
-	g.initBuiltInTypes()
+	g := newGenerator(opt)
 
 	for pass := 1; pass <= 2; pass++ {
-		var err error
-		for _, d := range file.Decls {
-			if fn, ok := d.(*ast.FuncDecl); ok {
-				g.log.Printf("Func %s", fn.Name.Name)
-			} else if decl, ok := d.(*ast.GenDecl); ok {
-				switch decl.Tok {
-				case token.TYPE:
-					for _, s := range decl.Specs {
-						if ts, ok := s.(*ast.TypeSpec); ok {
-							name := Name{g.inPkg, ts.Name.Name}
-							if stru, ok := ts.Type.(*ast.StructType); ok {
-								if pass == 1 {
-									err = g.preprocessStruct(ts, name, stru)
-								} else {
-									err = g.processStruct(ts, name, stru)
-								}
-								if err != nil {
-									return nil, err
-								}
-							} else {
-								if pass == 1 {
-									alias, err := g.resolveType(ts.Type)
-									if err == nil {
-										err = g.processAliasTypeDef(ts, name, alias)
-									} else {
-										err = g.processUnknownTypeDef(ts, name)
-									}
-									if err != nil {
-										return nil, err
-									}
-								}
-							}
-						} else {
-							panic("unexpected spec in type declaration")
-						}
-					}
+		for _, pkg := range pkgs {
+			for _, file := range pkg.Syntax {
+				err := g.processFile(file, pkg.PkgPath, pass)
+				if err != nil {
+					return nil, err
 				}
 			}
 		}
 	}
 
+	return g.finalizeAndGenerateCode()
+}
+
+func Generate(src []byte, opt Options) ([]byte, error) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	g := newGenerator(opt)
+
+	for pass := 1; pass <= 2; pass++ {
+		err = g.processFile(file, "", pass)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return g.finalizeAndGenerateCode()
+}
+
+func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error {
+	if pkgPath == "" {
+		pkgPath = file.Name.Name
+	}
+	if g.outPkgName == "" {
+		g.outPkgName = pkgPath
+	}
+	g.currentInPkgName = pkgPath
+	defer func() {
+		g.currentInPkgName = ""
+	}()
+	var err error
+	for _, d := range file.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok {
+			g.log.Printf("Func %s", fn.Name.Name)
+		} else if decl, ok := d.(*ast.GenDecl); ok {
+			switch decl.Tok {
+			case token.TYPE:
+				for _, s := range decl.Specs {
+					if ts, ok := s.(*ast.TypeSpec); ok {
+						name := Name{pkgPath, ts.Name.Name}
+						if stru, ok := ts.Type.(*ast.StructType); ok {
+							if pass == 1 {
+								err = g.preprocessStruct(ts, name, stru)
+							} else {
+								err = g.processStruct(ts, name, stru)
+							}
+							if err != nil {
+								return err
+							}
+						} else {
+							if pass == 1 {
+								alias, err := g.resolveType(ts.Type)
+								if err == nil {
+									err = g.processAliasTypeDef(ts, name, alias)
+								} else {
+									err = g.processUnknownTypeDef(ts, name)
+								}
+								if err != nil {
+									return err
+								}
+							}
+						}
+					} else {
+						panic("unexpected spec in type declaration")
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (g *generator) finalizeAndGenerateCode() ([]byte, error) {
 	g.facetTypeIdent = g.pubOrUnpub("Facet")
 	g.noneFacetIdent = g.pubOrUnpub("NoneFacet")
 
-	cg := newCodeGen(opt.PkgName)
+	cg := newCodeGen(g.outPkgName)
 	g.generateCode(cg)
 
-	formatted, err := format.Source(cg.Bytes())
+	raw := cg.Bytes()
+
+	formatted, err := format.Source(raw)
 	if err != nil {
-		return nil, err
+		return raw, err
 	}
 
 	return formatted, nil
 }
 
 func (g *generator) initBuiltInTypes() {
-	g.addType(&WellKnownPrimitive{Name: Name{"", "int64"}, ZeroValue: "0"})
-	g.addType(&WellKnownPrimitive{Name: Name{"", "int"}, ZeroValue: "0"})
-	g.addType(&WellKnownPrimitive{Name: Name{"", "string"}, ZeroValue: `""`})
+	i64 := g.addType(&WellKnownPrimitive{Name: Name{"", "int64"}, ZeroValue: "0"})
+	i := g.addType(&WellKnownPrimitive{Name: Name{"", "int"}, ZeroValue: "0"})
+	s := g.addType(&WellKnownPrimitive{Name: Name{"", "string"}, ZeroValue: `""`})
 	g.addType(&WellKnownPrimitive{Name: Name{"", "bool"}, ZeroValue: "false"})
-	g.addType(&WellKnownStruct{Name: Name{"time", "Time"}, IsZeroMethod: "IsZero", EqualMethod: "Equal"})
+	tm := g.addType(&WellKnownStruct{Name: Name{"time", "Time"}, IsZeroMethod: "IsZero", EqualMethod: "Equal"})
+
+	nullt := g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullString"}})
+	nullwr := &NullWrapping{Type: nullt, ValueType: s, ValueField: "String", ValidField: "Valid", Next: directAssignment{}}
+	g.nullStrategies[s.TypeName().FQN()] = nullwr
+
+	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullInt64"}})
+	nullwr = &NullWrapping{Type: nullt, ValueType: i64, ValueField: "Int64", ValidField: "Valid", Next: directAssignment{}}
+	g.nullStrategies[i64.TypeName().FQN()] = nullwr
+	g.nullStrategies[i.TypeName().FQN()] = nullwr
+
+	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullTime"}})
+	nullwr = &NullWrapping{Type: nullt, ValueType: tm, ValueField: "Time", ValidField: "Valid", Next: directAssignment{}}
+	g.nullStrategies[tm.TypeName().FQN()] = nullwr
+
 }
 
-func (g *generator) addType(t Type) {
+func (g *generator) addType(t Type) Type {
 	fqn := t.TypeName().FQN()
 	g.types[fqn] = t
+	return t
 }
 
 func (g *generator) pubOrUnpub(ident string) string {
@@ -285,16 +352,12 @@ func (g *generator) finalizeStructWithoutRefs(s *Struct) {
 		return
 	}
 
-	for i, col := range s.Cols {
-		col.IndexInStruct = i
-	}
-
 	for _, col := range s.Cols {
-		col.Facets = append(col.Facets, g.lookupFacet("all"))
+		col.AddFacet(g.lookupFacet("all"))
 		if col.Immutable {
-			col.Facets = append(col.Facets, g.lookupFacet("immutable"))
+			col.AddFacet(g.lookupFacet("immutable"))
 		} else {
-			col.Facets = append(col.Facets, g.lookupFacet("mutable"))
+			col.AddFacet(g.lookupFacet("mutable"))
 		}
 	}
 
@@ -310,6 +373,33 @@ func (g *generator) finalizeStructWithoutRefs(s *Struct) {
 }
 
 func (g *generator) finalizeStructWithRefs(s *Struct) {
+	g.resolveEmbeds(s)
+
+	s.TableNameConst = g.pubOrUnpub(s.PluralIdent + "Table")
+
+	for i, col := range s.Cols {
+		col.IndexInStruct = i
+		col.CodingStg = g.decideCodingStrategy(s, col)
+		col.DBNameConst = g.pubOrUnpub(s.SingularIdent + makeIdentFromFieldName(col.FieldName))
+	}
+}
+
+func makeIdentFromFieldName(fn string) string {
+	fn = publishedName(fn)
+	fn = strings.ReplaceAll(fn, ".", "")
+	return fn
+}
+
+func (g *generator) decideCodingStrategy(s *Struct, col *Col) CodingStrategy {
+	if col.Nullable && !isInherentlyNullable(col.Type) {
+		stg := g.nullStrategies[col.Type.TypeName().FQN()]
+		if stg == nil {
+			panic("cannot make nullable, TODO impl ptr strategy")
+		}
+		return stg
+	} else {
+		return directAssignment{}
+	}
 }
 
 func (g *generator) processField(s *Struct, field *ast.Field, name string) error {
@@ -343,6 +433,7 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 
 	col := &Col{
 		FieldName: name,
+		Type:      typ,
 	}
 	col.TempVarName = makeSafeTempName(name)
 
@@ -352,27 +443,106 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 		col.DBName = col.FieldName
 	}
 
+	var embedding *Embedding
+
 	for _, opt := range tag.Options {
-		if opt == "nullable" {
-			col.Nullable = true
-		} else if opt == "immutable" {
-			col.Immutable = true
-		} else if opt == "pk" {
-			col.Immutable = true
-			col.Facets = append(col.Facets, g.lookupFacet("pk"))
-		} else if strings.HasPrefix(opt, "#") {
+		if strings.HasPrefix(opt, "#") {
 			facetName := strings.TrimPrefix(opt, "#")
-			col.Facets = append(col.Facets, g.lookupFacet(facetName))
+			col.AddFacet(g.lookupFacet(facetName))
+		} else if p := strings.IndexByte(opt, ':'); p > 0 {
+			val := opt[p+1:]
+			opt = opt[:p]
+			switch opt {
+			case "insert":
+				switch val {
+				case "default":
+					col.InsertDefault = true
+				case "now":
+					col.InsertDefault = true
+					// TODO: insert NOW()
+				default:
+					return fmt.Errorf("%s.%s tag option %q has invalid value %q", s.Name, col.FieldName, opt, val)
+				}
+			default:
+				return fmt.Errorf("%s.%s tag has invalid option %q:%q", s.Name, col.FieldName, opt, val)
+			}
 		} else {
-			return fmt.Errorf("%s.%s tag has invalid option %q", s.Name, col.FieldName, opt)
+			switch opt {
+			case "nullable":
+				col.Nullable = true
+			case "immutable":
+				col.Immutable = true
+			case "pk":
+				col.Immutable = true
+				col.AddFacet(g.lookupFacet("pk"))
+			case "embed":
+				embeddedStruct, ok := typ.(*Struct)
+				if !ok {
+					return fmt.Errorf("%s.%s: can only embed a struct, got %v", s.Name, col.FieldName, typ.TypeName())
+				}
+				embedding = &Embedding{
+					FieldName: col.FieldName,
+					Struct:    embeddedStruct,
+					DBPrefix:  tag.Name,
+				}
+			default:
+				return fmt.Errorf("%s.%s tag has invalid option %q", s.Name, col.FieldName, opt)
+			}
 		}
 	}
 
-	s.Cols = append(s.Cols, col)
+	if col.InsertDefault {
+		col.AddFacet(g.lookupFacet("insertDefaults"))
+	} else {
+		col.AddFacet(g.lookupFacet("insert"))
+	}
 
-	g.log.Printf("field %s, tag %s, type %#v", name, tag, field.Type)
+	if embedding == nil {
+		g.addCol(s, col)
+	} else {
+		embedding.Facets = col.Facets
+		s.Embeddings = append(s.Embeddings, embedding)
+		g.log.Printf("field %s embeds %s", name, embedding.Struct.Name)
+	}
 
 	return nil
+}
+
+func (g *generator) resolveEmbeds(s *Struct) {
+	if s.embedsResolved {
+		return
+	}
+	s.embedsResolved = true
+
+	for _, embedding := range s.Embeddings {
+		g.processEmbedding(s, embedding)
+	}
+}
+
+func (g *generator) processEmbedding(s *Struct, embedding *Embedding) {
+	for _, ecol := range embedding.Struct.Cols {
+		g.resolveEmbeds(embedding.Struct)
+		col := &Col{
+			DBName:      embedding.DBPrefix + ecol.DBName,
+			FieldName:   embedding.FieldName + "." + ecol.FieldName,
+			Facets:      append([]*Facet(nil), ecol.Facets...),
+			Type:        ecol.Type,
+			TempVarName: unpublishedName(embedding.FieldName + publishedName(ecol.TempVarName)),
+
+			Nullable:      ecol.Nullable,
+			Immutable:     ecol.Immutable,
+			InsertDefault: ecol.InsertDefault,
+		}
+		for _, fct := range embedding.Facets {
+			col.AddFacet(fct)
+		}
+		g.addCol(s, col)
+	}
+}
+
+func (g *generator) addCol(s *Struct, col *Col) {
+	s.Cols = append(s.Cols, col)
+	g.log.Printf("%v.%s type %v", s.Name, col.FieldName, col.Type)
 }
 
 func makeSafeTempName(ident string) string {
@@ -414,6 +584,11 @@ func (g *generator) resolveTypeName(n Name) (Type, error) {
 	if t, ok := g.types[fqn]; ok {
 		return t, nil
 	} else {
+		if g.currentInPkgName != "" && n.Pkg == "" {
+			if t, err := g.resolveTypeName(Name{g.currentInPkgName, n.Ident}); err == nil {
+				return t, nil
+			}
+		}
 		g.log.Printf("Cannot resolve %v, known types are %+v", n, g.types)
 		return UnknownType(n), fmt.Errorf("unknown type %s", fqn)
 	}
@@ -510,6 +685,8 @@ func (g *generator) generateStructCode(cg *codeGen, s *Struct) {
 		deleteOne:  g.makeStructIdent(s, "Delete", "", false),
 	}
 
+	g.generateStructConsts(cg, s)
+
 	g.generateStructScanOneNew(cg, s, fns.scanOneNew, fns.scanOne, "row", Name{databaseSQL, "Row"})
 	g.generateStructScanOneNew(cg, s, fns.scanOneOfManyNew, fns.scanOneOfMany, "rows", Name{databaseSQL, "Rows"})
 	g.generateStructScanOne(cg, s, fns.scanOne, "row", Name{databaseSQL, "Row"})
@@ -532,6 +709,15 @@ func (g *generator) generateStructCode(cg *codeGen, s *Struct) {
 	g.generateStructDeleteOne(cg, s, fns)
 }
 
+func (g *generator) generateStructConsts(cg *codeGen, s *Struct) {
+	se := cg.imported(sqlexpr)
+	cg.Printf("const %s %s.Table = %q\n\n", s.TableNameConst, se, s.TableName)
+	cg.Printf("const (\n")
+	for _, col := range s.Cols {
+		cg.Printf("\t%s %s.Column = %q\n", col.DBNameConst, se, col.DBName)
+	}
+	cg.Printf(")\n\n")
+}
 func (g *generator) generateStructScanOneNew(cg *codeGen, s *Struct, fn string, scanfn string, argName string, argType Name) {
 	cg.Printf("func %s(%s *%s, fct %s) (*%s, error) {\n", fn, argName, cg.qualified(argType), g.facetTypeIdent, cg.qualified(s.Name))
 	cg.Printf("\tv := new(%s)\n", cg.qualified(s.Name))
@@ -543,9 +729,14 @@ func (g *generator) generateStructScanOneNew(cg *codeGen, s *Struct, fn string, 
 func (g *generator) generateStructScanOne(cg *codeGen, s *Struct, fn string, argName string, argType Name) {
 	cg.Printf("func %s(%s *%s, v *%s, fct %s) error {\n", fn, argName, cg.qualified(argType), cg.qualified(s.Name), g.facetTypeIdent)
 
-	scanners := makeScanners("v", s)
+	scanners := makeScanners(cg, "v", s)
 
-	generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+	g.generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+		if fct == nil {
+			cg.Printf("\t\tpanic(%q)\n", "cannot scan noneFacet!")
+			return
+		}
+
 		colScanners := filterExprs(scanners, cols)
 
 		appendBefore(cg, colScanners)
@@ -604,7 +795,12 @@ func (g *generator) generateStructFields(cg *codeGen, s *Struct, fns *funcNames)
 	se := cg.imported(sqlexpr)
 
 	cg.Printf("func %s(s %s.Fieldable, fct %s) {\n", fns.addFields, se, g.facetTypeIdent)
-	generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+	g.generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+		if fct == nil {
+			cg.Printf("\t\treturn\n")
+			return
+		}
+
 		for _, col := range cols {
 			cg.Printf("\t\ts.AddField(%s.Column(%q))\n", se, col.DBName)
 		}
@@ -616,10 +812,15 @@ func (g *generator) generateStructSetters(cg *codeGen, s *Struct, fns *funcNames
 	sFQN := cg.qualified(s.Name)
 	se := cg.imported(sqlexpr)
 
-	encoders := makeEncoders("v", s)
+	encoders := makeEncoders(cg, "v", s)
 
 	cg.Printf("func %s(s %s.Settable, v *%s, fct %s) {\n", fns.addSetters, se, sFQN, g.facetTypeIdent)
-	generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+	g.generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+		if fct == nil {
+			cg.Printf("\t\treturn\n")
+			return
+		}
+
 		colEncoders := filterExprs(encoders, cols)
 		appendBefore(cg, colEncoders)
 		for i, col := range cols {
@@ -634,10 +835,15 @@ func (g *generator) generateStructConditions(cg *codeGen, s *Struct, fns *funcNa
 	sFQN := cg.qualified(s.Name)
 	se := cg.imported(sqlexpr)
 
-	encoders := makeEncoders("v", s)
+	encoders := makeEncoders(cg, "v", s)
 
 	cg.Printf("func %s(s %s.Whereable, v *%s, fct %s) {\n", fns.addConditions, se, sFQN, g.facetTypeIdent)
-	generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+	g.generateFacetSwitch(cg, s, "fct", func(fct *Facet, cols []*Col) {
+		if fct == nil {
+			cg.Printf("\t\treturn\n")
+			return
+		}
+
 		colEncoders := filterExprs(encoders, cols)
 		appendBefore(cg, colEncoders)
 		for i, col := range cols {
@@ -699,8 +905,9 @@ func (g *generator) generateStructSelectOne(cg *codeGen, s *Struct, fns *funcNam
 	se := cg.imported(sqlexpr)
 	ctx := cg.imported(contextPkg)
 
-	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, fct %s, f func(*%s.Select)) (*%s, error) {\n", fns.selectOne, ctx, se, g.facetTypeIdent, se, sFQN)
+	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, fct %s, where %s.Expr, f func(*%s.Select)) (*%s, error) {\n", fns.selectOne, ctx, se, g.facetTypeIdent, se, se, sFQN)
 	cg.Printf("\ts := %s(fct)\n", fns.buildSelect)
+	cg.Printf("\tif where != nil { s.AddWhere(where) }\n")
 	cg.Printf("\tif f != nil { f(s) }\n")
 	cg.Printf("\trow := s.QueryRow(ctx, ex)\n")
 	cg.Printf("\treturn %s(row, fct)\n", fns.scanOneNew)
@@ -712,8 +919,9 @@ func (g *generator) generateStructSelectMany(cg *codeGen, s *Struct, fns *funcNa
 	se := cg.imported(sqlexpr)
 	ctx := cg.imported(contextPkg)
 
-	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, fct %s, f func(*%s.Select)) ([]*%s, error) {\n", fns.selectMany, ctx, se, g.facetTypeIdent, se, sFQN)
+	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, fct %s, where %s.Expr, f func(*%s.Select)) ([]*%s, error) {\n", fns.selectMany, ctx, se, g.facetTypeIdent, se, se, sFQN)
 	cg.Printf("\ts := %s(fct)\n", fns.buildSelect)
+	cg.Printf("\tif where != nil { s.AddWhere(where) }\n")
 	cg.Printf("\tif f != nil { f(s) }\n")
 	cg.Printf("\trows, err := s.Query(ctx, ex)\n")
 	cg.Printf("\tif err != nil {\n")
@@ -731,8 +939,13 @@ func (g *generator) generateStructInsertOne(cg *codeGen, s *Struct, fns *funcNam
 	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, v *%s, setFct, retFct %s, f func(*%s.Insert)) error {\n", fns.insertOne, ctx, se, sFQN, g.facetTypeIdent, se)
 	cg.Printf("\ts := %s(v, setFct, retFct)\n", fns.buildInsert)
 	cg.Printf("\tif f != nil { f(s) }\n")
-	cg.Printf("\trow := s.QueryRow(ctx, ex)\n")
-	cg.Printf("\treturn %s(row, v, retFct)\n", fns.scanOne)
+	cg.Printf("\tif retFct == %s {\n", g.noneFacetIdent)
+	cg.Printf("\t\t_, err := s.Exec(ctx, ex)\n")
+	cg.Printf("\t\treturn err\n")
+	cg.Printf("\t} else {\n")
+	cg.Printf("\t\trow := s.QueryRow(ctx, ex)\n")
+	cg.Printf("\t\treturn %s(row, v, retFct)\n", fns.scanOne)
+	cg.Printf("\t}\n")
 	cg.Printf("}\n\n")
 }
 
@@ -744,8 +957,13 @@ func (g *generator) generateStructUpdateOne(cg *codeGen, s *Struct, fns *funcNam
 	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, v *%s, condFct, updateFct, retFct %s, f func(*%s.Update)) error {\n", fns.updateOne, ctx, se, sFQN, g.facetTypeIdent, se)
 	cg.Printf("\ts := %s(v, condFct, updateFct, retFct)\n", fns.buildUpdate)
 	cg.Printf("\tif f != nil { f(s) }\n")
-	cg.Printf("\trow := s.QueryRow(ctx, ex)\n")
-	cg.Printf("\treturn %s(row, v, retFct)\n", fns.scanOne)
+	cg.Printf("\tif retFct == %s {\n", g.noneFacetIdent)
+	cg.Printf("\t\t_, err := s.Exec(ctx, ex)\n")
+	cg.Printf("\t\treturn err\n")
+	cg.Printf("\t} else {\n")
+	cg.Printf("\t\trow := s.QueryRow(ctx, ex)\n")
+	cg.Printf("\t\treturn %s(row, v, retFct)\n", fns.scanOne)
+	cg.Printf("\t}\n")
 	cg.Printf("}\n\n")
 }
 
@@ -770,8 +988,10 @@ func filterExprs(exprs []*WrappedExpr, cols []*Col) []*WrappedExpr {
 	return filtered
 }
 
-func generateFacetSwitch(cg *codeGen, s *Struct, fctVar string, f func(fct *Facet, cols []*Col)) {
+func (g *generator) generateFacetSwitch(cg *codeGen, s *Struct, fctVar string, f func(fct *Facet, cols []*Col)) {
 	cg.Printf("\tswitch %s {\n", fctVar)
+	cg.Printf("\tcase %s:\n", g.noneFacetIdent)
+	f(nil, nil)
 	for _, fct := range s.Facets {
 		cg.Printf("\tcase %s:\n", fct.Ident)
 
@@ -789,37 +1009,22 @@ func generateFacetSwitch(cg *codeGen, s *Struct, fctVar string, f func(fct *Face
 	cg.Printf("\t}\n")
 }
 
-func makeScanners(sVar string, s *Struct) []*WrappedExpr {
+func makeScanners(imp importer, sVar string, s *Struct) []*WrappedExpr {
 	var exprs []*WrappedExpr
 	for _, col := range s.Cols {
-		expr := makeScanner(sVar+"."+col.FieldName, col.TempVarName, col)
+		expr := col.CodingStg.makeScanner(imp, sVar+"."+col.FieldName, col.TempVarName, col)
 		exprs = append(exprs, expr)
 	}
 	return exprs
 }
 
-func makeScanner(dest string, temp string, col *Col) *WrappedExpr {
-	if col.Nullable && !isInherentlyNullable(col.Type) {
-		// TODO: handle nullable
-	}
-	return &WrappedExpr{
-		Value: "&" + dest,
-	}
-}
-
-func makeEncoders(sVar string, s *Struct) []*WrappedExpr {
+func makeEncoders(imp importer, sVar string, s *Struct) []*WrappedExpr {
 	var exprs []*WrappedExpr
 	for _, col := range s.Cols {
-		expr := makeEncoder(sVar+"."+col.FieldName, col.TempVarName, col)
+		expr := col.CodingStg.makeEncoder(imp, sVar+"."+col.FieldName, col.TempVarName, col)
 		exprs = append(exprs, expr)
 	}
 	return exprs
-}
-
-func makeEncoder(src string, temp string, col *Col) *WrappedExpr {
-	return &WrappedExpr{
-		Value: src,
-	}
 }
 
 func isInherentlyNullable(typ Type) bool {
@@ -831,6 +1036,78 @@ func isInherentlyNullable(typ Type) bool {
 	}
 }
 
+type CodingStrategy interface {
+	makeScanner(imp importer, dest string, temp string, col *Col) *WrappedExpr
+	makeEncoder(imp importer, src string, temp string, col *Col) *WrappedExpr
+}
+
+type directAssignment struct{}
+
+func (e directAssignment) makeScanner(imp importer, dest string, temp string, col *Col) *WrappedExpr {
+	return &WrappedExpr{
+		Value: "&" + dest,
+	}
+}
+
+func (e directAssignment) makeEncoder(imp importer, src string, temp string, col *Col) *WrappedExpr {
+	return &WrappedExpr{
+		Value: src,
+	}
+}
+
+type NullWrapping struct {
+	Type       Type
+	ValueType  Type
+	ValidField string
+	ValueField string
+	Next       CodingStrategy
+}
+
+func (e NullWrapping) makeScanner(imp importer, dest string, temp string, col *Col) *WrappedExpr {
+	subwe := e.Next.makeScanner(imp, temp, temp+"1", col)
+
+	we := &WrappedExpr{
+		DBExpr: subwe.DBExpr,
+		Value:  "&" + temp,
+	}
+	we.Vars = append(we.Vars, fmt.Sprintf("%s %s", temp, imp.qualified(e.Type.TypeName())))
+	we.Append(subwe)
+
+	if e.ValueType.String() != col.Type.String() {
+		we.After = append(we.After, fmt.Sprintf("%s = %s(%s.%s)", dest, col.Type.String(), temp, e.ValueField))
+	} else {
+		we.After = append(we.After, fmt.Sprintf("%s = %s.%s", dest, temp, e.ValueField))
+	}
+	return we
+}
+
+func (e NullWrapping) makeEncoder(imp importer, src string, temp string, col *Col) *WrappedExpr {
+	subwe := e.Next.makeScanner(imp, temp, temp+"1", col)
+
+	we := &WrappedExpr{
+		DBExpr: subwe.DBExpr,
+		Value:  temp,
+	}
+	we.Vars = append(we.Vars, fmt.Sprintf("%s %s", temp, imp.qualified(e.Type.TypeName())))
+
+	var expr string
+	if e.ValueType.String() != col.Type.String() {
+		expr = fmt.Sprintf("%s(%s)", e.ValueType.String(), src)
+	} else {
+		expr = src
+	}
+
+	check := e.ValueType.MakeZeroValueCheck(imp, expr)
+
+	we.Before = append(we.Before, fmt.Sprintf("if !(%s) {", check))
+	we.Before = append(we.Before, fmt.Sprintf("\t%s.%s = %s", temp, e.ValueField, expr))
+	we.Before = append(we.Before, fmt.Sprintf("\t%s.%s = true", temp, e.ValidField))
+	we.Before = append(we.Before, fmt.Sprintf("}"))
+
+	we.Append(subwe)
+	return we
+}
+
 type Facet struct {
 	Name  string
 	Ident string
@@ -839,11 +1116,27 @@ type Facet struct {
 
 type Type interface {
 	TypeName() Name
+	MakeZeroValue(imp importer) string
+	// Returns empty string to indicate failure
+	MakeZeroValueCheck(imp importer, v string) string
+	fmt.Stringer
 }
 
 type WellKnownPrimitive struct {
 	Name      Name
 	ZeroValue string
+}
+
+func (t WellKnownPrimitive) String() string {
+	return t.Name.String()
+}
+
+func (t WellKnownPrimitive) MakeZeroValue(imp importer) string {
+	return t.ZeroValue
+}
+
+func (t WellKnownPrimitive) MakeZeroValueCheck(imp importer, v string) string {
+	return fmt.Sprintf("%s == %s", v, t.ZeroValue)
 }
 
 func (t WellKnownPrimitive) TypeName() Name {
@@ -854,6 +1147,18 @@ type UnsupportedType struct {
 	Name Name
 }
 
+func (t UnsupportedType) String() string {
+	return t.Name.String()
+}
+
+func (t UnsupportedType) MakeZeroValue(imp importer) string {
+	return imp.qualified(t.Name) + "{}"
+}
+
+func (t UnsupportedType) MakeZeroValueCheck(imp importer, v string) string {
+	return ""
+}
+
 func (t UnsupportedType) TypeName() Name {
 	return t.Name
 }
@@ -861,6 +1166,18 @@ func (t UnsupportedType) TypeName() Name {
 type AliasType struct {
 	Name    Name
 	AliasOf Type
+}
+
+func (t AliasType) String() string {
+	return t.Name.String() + "=" + t.AliasOf.String()
+}
+
+func (t AliasType) MakeZeroValue(imp importer) string {
+	return imp.qualified(t.Name) + "(" + t.AliasOf.MakeZeroValue(imp) + ")"
+}
+
+func (t AliasType) MakeZeroValueCheck(imp importer, v string) string {
+	return t.AliasOf.MakeZeroValueCheck(imp, v)
 }
 
 func (t AliasType) TypeName() Name {
@@ -874,11 +1191,38 @@ type WellKnownStruct struct {
 	EqualMethod  string
 }
 
+func (t WellKnownStruct) String() string {
+	return t.Name.String()
+}
+
+func (t WellKnownStruct) MakeZeroValue(imp importer) string {
+	return imp.qualified(t.Name) + "{}"
+}
+
+func (t WellKnownStruct) MakeZeroValueCheck(imp importer, v string) string {
+	if t.IsZeroMethod != "" {
+		return fmt.Sprintf("%s.%s()", v, t.IsZeroMethod)
+	}
+	return ""
+}
+
 func (t WellKnownStruct) TypeName() Name {
 	return t.Name
 }
 
 type UnknownType Name
+
+func (t UnknownType) String() string {
+	return Name(t).String()
+}
+
+func (t UnknownType) MakeZeroValue(imp importer) string {
+	panic("cannot make zero value of unknown type")
+}
+
+func (t UnknownType) MakeZeroValueCheck(imp importer, v string) string {
+	return ""
+}
 
 func (u UnknownType) TypeName() Name {
 	return Name(u)
@@ -886,6 +1230,18 @@ func (u UnknownType) TypeName() Name {
 
 type PtrType struct {
 	To Type
+}
+
+func (t PtrType) String() string {
+	return "*" + t.To.String()
+}
+
+func (t PtrType) MakeZeroValue(imp importer) string {
+	return "nil"
+}
+
+func (t PtrType) MakeZeroValueCheck(imp importer, v string) string {
+	return fmt.Sprintf("%s == nil", v)
 }
 
 func (t PtrType) TypeName() Name {
@@ -897,13 +1253,29 @@ type Struct struct {
 
 	Name Name
 
-	TableName     string
-	SingularIdent string
-	PluralIdent   string
+	TableName      string
+	TableNameConst string
+	SingularIdent  string
+	PluralIdent    string
 
 	Cols []*Col
 
+	Embeddings     []*Embedding
+	embedsResolved bool
+
 	Facets []*Facet
+}
+
+func (s *Struct) String() string {
+	return s.Name.String() + "{}"
+}
+
+func (s *Struct) MakeZeroValue(imp importer) string {
+	return imp.qualified(s.Name) + "{}"
+}
+
+func (s *Struct) MakeZeroValueCheck(imp importer, v string) string {
+	return ""
 }
 
 func (s *Struct) TypeName() Name {
@@ -913,17 +1285,33 @@ func (s *Struct) TypeName() Name {
 type Col struct {
 	IndexInStruct int
 
-	DBName    string
-	FieldName string
-	Facets    []*Facet
-	Type      Type
-
-	Nullable  bool
-	Immutable bool
-
+	DBNameConst string
+	DBName      string
+	FieldName   string
+	Facets      []*Facet
+	Type        Type
 	TempVarName string
+	CodingStg   CodingStrategy
+
+	Nullable      bool
+	Immutable     bool
+	InsertDefault bool
 }
 
+func (c *Col) HasFacet(f *Facet) bool {
+	for _, cf := range c.Facets {
+		if cf == f {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Col) AddFacet(fct *Facet) {
+	if !c.HasFacet(fct) {
+		c.Facets = append(c.Facets, fct)
+	}
+}
 func (c *Col) IncludedInFacet(f *Facet) bool {
 	for _, cf := range c.Facets {
 		if cf == f {
@@ -931,6 +1319,14 @@ func (c *Col) IncludedInFacet(f *Facet) bool {
 		}
 	}
 	return false
+}
+
+type Embedding struct {
+	FieldName string
+	Facets    []*Facet
+	Struct    *Struct
+	Cols      []*Col
+	DBPrefix  string
 }
 
 type Name struct {
@@ -962,6 +1358,12 @@ type WrappedExpr struct {
 	After  []string
 }
 
+func (we *WrappedExpr) Append(another *WrappedExpr) {
+	we.Vars = append(we.Vars, another.Vars...)
+	we.Before = append(we.Before, another.Before...)
+	we.After = append(we.After, another.After...)
+}
+
 func appendBefore(cg *codeGen, exprs []*WrappedExpr) {
 	for _, expr := range exprs {
 		for _, s := range expr.Vars {
@@ -979,6 +1381,11 @@ func appendAfter(cg *codeGen, exprs []*WrappedExpr) {
 			cg.Printf("\t\t%s\n", s)
 		}
 	}
+}
+
+type importer interface {
+	imported(pkg string) string
+	qualified(n Name) string
 }
 
 type codeGen struct {
@@ -1008,7 +1415,7 @@ func (cg *codeGen) imported(pkg string) string {
 }
 
 func (cg *codeGen) qualified(n Name) string {
-	if n.Pkg == "" {
+	if n.Pkg == "" || n.Pkg == cg.pkgName {
 		return n.Ident
 	} else {
 		return cg.imported(n.Pkg) + "." + n.Ident

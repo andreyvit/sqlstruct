@@ -6,15 +6,16 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/andreyvit/sqlstruct"
 )
 
 var (
-	inFile  = flag.String("in", "", "input file or directory name")
-	inPkg   = flag.String("inPkg", "", "input package name")
+	in      = flag.String("in", "", "input package name(s)")
 	outFile = flag.String("out", "", "output file name")
 	pkgName = flag.String("pkg", "", "package name")
+	pub     = flag.Bool("pub", false, "generate published funcs and types")
 )
 
 var (
@@ -35,33 +36,29 @@ func main() {
 }
 
 func run() error {
-	if *inFile == "" {
-		return fmt.Errorf("input file not specified")
+	if *in == "" {
+		return fmt.Errorf("-in not specified")
 	}
 
-	inData, err := ioutil.ReadFile(*inFile)
-	if err != nil {
-		return err
-	}
+	inPkgs := strings.Split(*in, ",")
 
-	outData, err := sqlstruct.Generate(inData, sqlstruct.Options{
-		Logger:        stdLog,
-		InputFileName: *inFile,
-		InputPkgName:  *inPkg,
-		PkgName:       *pkgName,
+	outData, genErr := sqlstruct.GeneratePkg(inPkgs, sqlstruct.Options{
+		Logger:    stdLog,
+		PkgName:   *pkgName,
+		Published: *pub,
 	})
-	if err != nil {
-		return err
+	if genErr != nil && outData == nil {
+		return genErr
 	}
 
 	if *outFile == "" {
 		fmt.Fprintln(os.Stdout, string(outData))
 	} else {
-		err = ioutil.WriteFile(*outFile, outData, 0644)
+		err := ioutil.WriteFile(*outFile, outData, 0644)
 		if err != nil {
 			return err
 		}
 	}
 
-	return nil
+	return genErr
 }

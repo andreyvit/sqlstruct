@@ -7,4 +7,5 @@ require (
 	github.com/andreyvit/sqlexpr v0.0.0-20191209023104-112bc594d717 // indirect
 	github.com/fatih/structtag v1.2.0
 	github.com/sergi/go-diff v1.0.0 // indirect
+	golang.org/x/tools v0.0.0-20191206204035-259af5ff87bd
 )
