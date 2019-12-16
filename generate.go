@@ -418,7 +418,7 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 		tag, _ = tags.Get("db")
 	}
 
-	if tag == nil {
+	if tag == nil || tag.Name == "-" {
 		return nil
 	}
 
