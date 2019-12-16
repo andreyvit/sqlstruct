@@ -50,8 +50,10 @@ type generator struct {
 
 	facets map[string]*Facet
 
-	facetTypeIdent string
-	noneFacetIdent string
+	facetTypeIdent  string
+	noneFacetIdent  string
+	verifyAffected  string
+	errNoneAffected string
 }
 
 func newGenerator(opt Options) *generator {
@@ -168,6 +170,8 @@ func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error 
 func (g *generator) finalizeAndGenerateCode() ([]byte, error) {
 	g.facetTypeIdent = g.pubOrUnpub("Facet")
 	g.noneFacetIdent = g.pubOrUnpub("NoneFacet")
+	g.verifyAffected = g.pubOrUnpub("VerifyAffected")
+	g.errNoneAffected = g.pubOrUnpub("ErrNoneAffected")
 
 	cg := newCodeGen(g.outPkgName)
 	g.generateCode(cg)
@@ -599,6 +603,7 @@ func (g *generator) generateCode(cg *codeGen) {
 		g.finalizeStructWithRefs(s)
 	}
 
+	g.generateVerifyAffected(cg)
 	g.generateFacetsCode(cg)
 
 	for _, s := range g.persistentStructs {
@@ -635,6 +640,35 @@ func (g *generator) generateFacetsCode(cg *codeGen) {
 	cg.Printf("\tdefault:\n")
 	cg.Printf("\t\tpanic(%q)\n", "unknown facet")
 	cg.Printf("\t}\n")
+	cg.Printf("}\n\n")
+}
+
+func (g *generator) generateVerifyAffected(cg *codeGen) {
+	// res, err := s.Exec(ctx, ex)
+	// if err != nil {
+	// 	return err
+	// }
+	// affected, err := res.RowsAffected()
+	// if err != nil {
+	// 	return err
+	// }
+	// if affected == 0 {
+	// 	return fmt.Errorf("no rows affected")
+	// }
+
+	sql := cg.imported(databaseSQL)
+	errors := cg.imported("errors")
+
+	cg.Printf("var %s = %s.New(%q)\n\n", g.errNoneAffected, errors, "no rows affected")
+
+	cg.Printf("func %s(res %s.Result, err error) error {\n", g.verifyAffected, sql)
+	cg.Printf("\tif err != nil { return err }\n")
+	cg.Printf("\taffected, err := res.RowsAffected()\n")
+	cg.Printf("\tif err != nil { return err }\n")
+	cg.Printf("\tif affected == 0 {\n")
+	cg.Printf("\t\treturn %s\n", g.errNoneAffected)
+	cg.Printf("\t}\n")
+	cg.Printf("\treturn nil\n")
 	cg.Printf("}\n\n")
 }
 
@@ -958,8 +992,8 @@ func (g *generator) generateStructUpdateOne(cg *codeGen, s *Struct, fns *funcNam
 	cg.Printf("\ts := %s(v, condFct, updateFct, retFct)\n", fns.buildUpdate)
 	cg.Printf("\tif f != nil { f(s) }\n")
 	cg.Printf("\tif retFct == %s {\n", g.noneFacetIdent)
-	cg.Printf("\t\t_, err := s.Exec(ctx, ex)\n")
-	cg.Printf("\t\treturn err\n")
+	cg.Printf("\t\tres, err := s.Exec(ctx, ex)\n")
+	cg.Printf("\t\treturn %s(res, err)\n", g.verifyAffected)
 	cg.Printf("\t} else {\n")
 	cg.Printf("\t\trow := s.QueryRow(ctx, ex)\n")
 	cg.Printf("\t\treturn %s(row, v, retFct)\n", fns.scanOne)
@@ -975,8 +1009,8 @@ func (g *generator) generateStructDeleteOne(cg *codeGen, s *Struct, fns *funcNam
 	cg.Printf("func %s(ctx %s.Context, ex %s.Executor, v *%s, condFct %s, f func(*%s.Delete)) error {\n", fns.deleteOne, ctx, se, sFQN, g.facetTypeIdent, se)
 	cg.Printf("\ts := %s(v, condFct)\n", fns.buildDelete)
 	cg.Printf("\tif f != nil { f(s) }\n")
-	cg.Printf("\t_, err := s.Exec(ctx, ex)\n")
-	cg.Printf("\treturn err\n")
+	cg.Printf("\tres, err := s.Exec(ctx, ex)\n")
+	cg.Printf("\treturn %s(res, err)\n", g.verifyAffected)
 	cg.Printf("}\n\n")
 }
 
