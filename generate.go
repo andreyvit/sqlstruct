@@ -360,16 +360,6 @@ func (g *generator) finalizeStructWithoutRefs(s *Struct) {
 			col.AddFacet(g.lookupFacet("mutable"))
 		}
 	}
-
-	facets := make(map[string]bool)
-	for _, col := range s.Cols {
-		for _, f := range col.Facets {
-			if !facets[f.Name] {
-				facets[f.Name] = true
-				s.Facets = append(s.Facets, f)
-			}
-		}
-	}
 }
 
 func (g *generator) finalizeStructWithRefs(s *Struct) {
@@ -381,6 +371,16 @@ func (g *generator) finalizeStructWithRefs(s *Struct) {
 		col.IndexInStruct = i
 		col.CodingStg = g.decideCodingStrategy(s, col)
 		col.DBNameConst = g.pubOrUnpub(s.SingularIdent + makeIdentFromFieldName(col.FieldName))
+	}
+
+	facets := make(map[string]bool)
+	for _, col := range s.Cols {
+		for _, f := range col.Facets {
+			if !facets[f.Name] {
+				facets[f.Name] = true
+				s.Facets = append(s.Facets, f)
+			}
+		}
 	}
 }
 
