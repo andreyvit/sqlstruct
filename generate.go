@@ -756,7 +756,8 @@ func (g *generator) generateStructScanOneNew(cg *codeGen, s *Struct, fn string, 
 	cg.Printf("func %s(%s *%s, fct %s) (*%s, error) {\n", fn, argName, cg.qualified(argType), g.facetTypeIdent, cg.qualified(s.Name))
 	cg.Printf("\tv := new(%s)\n", cg.qualified(s.Name))
 	cg.Printf("\terr := %s(%s, v, fct)\n", scanfn, argName)
-	cg.Printf("\treturn v, err\n")
+	cg.Printf("\tif err != nil { return nil, err }\n")
+	cg.Printf("\treturn v, nil\n")
 	cg.Printf("}\n\n")
 }
 
