@@ -50,10 +50,12 @@ type generator struct {
 
 	facets map[string]*Facet
 
-	facetTypeIdent  string
-	noneFacetIdent  string
-	verifyAffected  string
-	errNoneAffected string
+	queryResultLoggerInterface string
+	logQueryResultFunc         string
+	facetTypeIdent             string
+	noneFacetIdent             string
+	verifyAffected             string
+	errNoneAffected            string
 }
 
 func newGenerator(opt Options) *generator {
@@ -168,6 +170,8 @@ func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error 
 }
 
 func (g *generator) finalizeAndGenerateCode() ([]byte, error) {
+	g.queryResultLoggerInterface = g.pubOrUnpub("QueryResultLogger")
+	g.logQueryResultFunc = g.pubOrUnpub("logQueryResult")
 	g.facetTypeIdent = g.pubOrUnpub("Facet")
 	g.noneFacetIdent = g.pubOrUnpub("NoneFacet")
 	g.verifyAffected = g.pubOrUnpub("VerifyAffected")
@@ -248,6 +252,48 @@ func (g *generator) preprocessStruct(ts *ast.TypeSpec, structName Name, stru *as
 	s := &Struct{
 		Name: structName,
 	}
+
+	if ts.Comment != nil {
+		for _, comment := range ts.Comment.List {
+			text := comment.Text
+			if t := strings.TrimPrefix(text, "/*"); t != text {
+				text = strings.TrimSuffix(t, "*/")
+			} else if t := strings.TrimPrefix(text, "//"); t != text {
+				text = t
+			} else {
+				panic(fmt.Errorf("invalid comment text %q", text))
+			}
+			text = strings.TrimSpace(text)
+			if !strings.HasPrefix(text, "db:") {
+				continue
+			}
+
+			for _, line := range strings.Split(text, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				fields := append(strings.Fields(line), "", "", "", "")
+				switch fields[0] {
+				case "db:plural":
+					s.PluralIdent = g.pubOrUnpub(fields[1])
+				case "db:table":
+					s.TableName = fields[1]
+				case "db:facet":
+					//
+				case "db:select_by":
+					//
+				case "db:value":
+					s.IsValue = true
+				default:
+					return fmt.Errorf("invalid struct %s DB comment line %q", s.Name, line)
+				}
+			}
+			g.log.Printf("******* comment for %s: %q", s.Name, comment.Text)
+		}
+		// panic("XXX")
+	}
+
 	g.addType(s)
 	return nil
 }
@@ -287,45 +333,6 @@ func (g *generator) processStruct(ts *ast.TypeSpec, structName Name, stru *ast.S
 				}
 			}
 		}
-	}
-
-	if ts.Comment != nil {
-		for _, comment := range ts.Comment.List {
-			text := comment.Text
-			if t := strings.TrimPrefix(text, "/*"); t != text {
-				text = strings.TrimSuffix(t, "*/")
-			} else if t := strings.TrimPrefix(text, "//"); t != text {
-				text = t
-			} else {
-				panic(fmt.Errorf("invalid comment text %q", text))
-			}
-			text = strings.TrimSpace(text)
-			if !strings.HasPrefix(text, "db:") {
-				continue
-			}
-
-			for _, line := range strings.Split(text, "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				fields := append(strings.Fields(line), "", "", "", "")
-				switch fields[0] {
-				case "db:plural":
-					s.PluralIdent = g.pubOrUnpub(fields[1])
-				case "db:table":
-					s.TableName = fields[1]
-				case "db:facet":
-					//
-				case "db:select_by":
-					//
-				default:
-					return fmt.Errorf("invalid struct %s DB comment line %q", s.Name, line)
-				}
-			}
-			g.log.Printf("******* comment for %s: %q", s.Name, comment.Text)
-		}
-		// panic("XXX")
 	}
 
 	if s.SingularIdent == "" {
@@ -398,7 +405,8 @@ func (g *generator) decideCodingStrategy(s *Struct, col *Col) CodingStrategy {
 	if col.Nullable && !isInherentlyNullable(col.Type) {
 		stg := g.nullStrategies[col.Type.TypeName().FQN()]
 		if stg == nil {
-			panic("cannot make nullable, TODO impl ptr strategy")
+			stg = PtrWrapping{col.Type, directAssignment{}}
+			// panic(fmt.Sprintf("cannot make %s nullable, TODO impl ptr strategy", col.Type.TypeName().FQN()))
 		}
 		return stg
 	} else {
@@ -603,12 +611,20 @@ func (g *generator) generateCode(cg *codeGen) {
 		g.finalizeStructWithRefs(s)
 	}
 
+	g.generateLogging(cg)
 	g.generateVerifyAffected(cg)
 	g.generateFacetsCode(cg)
 
 	for _, s := range g.persistentStructs {
 		g.generateStructCode(cg, s)
 	}
+}
+
+func (g *generator) generateLogging(cg *codeGen) {
+	cg.Printf("type %s interface {\n", g.queryResultLoggerInterface)
+	cg.Printf("\tIsLoggingQueryResults() bool\n")
+	cg.Printf("\tLogQueryResult(method string, query string, args []interface{}, rowCount int, err error, result interface{})\n")
+	cg.Printf("}\n\n")
 }
 
 func (g *generator) generateFacetsCode(cg *codeGen) {
@@ -644,18 +660,6 @@ func (g *generator) generateFacetsCode(cg *codeGen) {
 }
 
 func (g *generator) generateVerifyAffected(cg *codeGen) {
-	// res, err := s.Exec(ctx, ex)
-	// if err != nil {
-	// 	return err
-	// }
-	// affected, err := res.RowsAffected()
-	// if err != nil {
-	// 	return err
-	// }
-	// if affected == 0 {
-	// 	return fmt.Errorf("no rows affected")
-	// }
-
 	sql := cg.imported(databaseSQL)
 	errors := cg.imported("errors")
 
@@ -944,8 +948,13 @@ func (g *generator) generateStructSelectOne(cg *codeGen, s *Struct, fns *funcNam
 	cg.Printf("\ts := %s(fct)\n", fns.buildSelect)
 	cg.Printf("\tif where != nil { s.AddWhere(where) }\n")
 	cg.Printf("\tif f != nil { f(s) }\n")
-	cg.Printf("\trow := s.QueryRow(ctx, ex)\n")
-	cg.Printf("\treturn %s(row, fct)\n", fns.scanOneNew)
+	cg.Printf("\tquery, args := %s.Build(s)\n", se)
+	cg.Printf("\trow := ex.QueryRowContext(ctx, query, args...)\n")
+	cg.Printf("\tresult, err := %s(row, fct)\n", fns.scanOneNew)
+	cg.Printf("\tif logger, ok := ex.(%s); ok && logger.IsLoggingQueryResults() {\n", g.queryResultLoggerInterface)
+	cg.Printf("\t\tlogger.LogQueryResult(%q, query, args, map[bool]int{false: 0, true: 1}[err == nil], err, result)\n", fns.selectOne)
+	cg.Printf("\t}\n")
+	cg.Printf("\treturn result, err\n")
 	cg.Printf("}\n\n")
 }
 
@@ -958,11 +967,19 @@ func (g *generator) generateStructSelectMany(cg *codeGen, s *Struct, fns *funcNa
 	cg.Printf("\ts := %s(fct)\n", fns.buildSelect)
 	cg.Printf("\tif where != nil { s.AddWhere(where) }\n")
 	cg.Printf("\tif f != nil { f(s) }\n")
-	cg.Printf("\trows, err := s.Query(ctx, ex)\n")
+	cg.Printf("\tquery, args := %s.Build(s)\n", se)
+	cg.Printf("\trows, err := ex.QueryContext(ctx, query, args...)\n")
 	cg.Printf("\tif err != nil {\n")
+	cg.Printf("\t\tif logger, ok := ex.(%s); ok && logger.IsLoggingQueryResults() {\n", g.queryResultLoggerInterface)
+	cg.Printf("\t\t\tlogger.LogQueryResult(%q, query, args, 0, err, nil)\n", fns.selectMany)
+	cg.Printf("\t\t}\n")
 	cg.Printf("\t\treturn nil, err\n")
 	cg.Printf("\t}\n")
-	cg.Printf("\treturn %s(rows, fct)\n", fns.scanMult)
+	cg.Printf("\tresult, err := %s(rows, fct)\n", fns.scanMult)
+	cg.Printf("\tif logger, ok := ex.(%s); ok && logger.IsLoggingQueryResults() {\n", g.queryResultLoggerInterface)
+	cg.Printf("\t\tlogger.LogQueryResult(%q, query, args, len(result), err, result)\n", fns.selectOne)
+	cg.Printf("\t}\n")
+	cg.Printf("\treturn result, err\n")
 	cg.Printf("}\n\n")
 }
 
@@ -1143,6 +1160,50 @@ func (e NullWrapping) makeEncoder(imp importer, src string, temp string, col *Co
 	return we
 }
 
+type PtrWrapping struct {
+	Type Type
+	Next CodingStrategy
+}
+
+func (e PtrWrapping) makeScanner(imp importer, dest string, temp string, col *Col) *WrappedExpr {
+	subwe := e.Next.makeScanner(imp, temp, temp+"1", col)
+
+	we := &WrappedExpr{
+		DBExpr: subwe.DBExpr,
+		Value:  "&" + temp,
+	}
+	we.Vars = append(we.Vars, fmt.Sprintf("%s *%s", temp, imp.qualified(e.Type.TypeName())))
+	we.Append(subwe)
+
+	we.After = append(we.After,
+		fmt.Sprintf("if %s != nil {", temp),
+		fmt.Sprintf("\t%s = *%s", dest, temp),
+		"}")
+	return we
+}
+
+func (e PtrWrapping) makeEncoder(imp importer, src string, temp string, col *Col) *WrappedExpr {
+	subwe := e.Next.makeScanner(imp, temp, temp+"1", col)
+
+	we := &WrappedExpr{
+		DBExpr: subwe.DBExpr,
+		Value:  temp,
+	}
+	we.Vars = append(we.Vars, fmt.Sprintf("%s *%s", temp, imp.qualified(e.Type.TypeName())))
+
+	check := e.Type.MakeZeroValueCheck(imp, src)
+	if check == "" {
+		check = fmt.Sprintf("/* type %s does not support zero value checking */", e.Type.TypeName())
+	}
+
+	we.Before = append(we.Before, fmt.Sprintf("if !(%s) {", check))
+	we.Before = append(we.Before, fmt.Sprintf("\t%s = &%s", temp, src))
+	we.Before = append(we.Before, fmt.Sprintf("}"))
+
+	we.Append(subwe)
+	return we
+}
+
 type Facet struct {
 	Name  string
 	Ident string
@@ -1285,6 +1346,7 @@ func (t PtrType) TypeName() Name {
 
 type Struct struct {
 	Persistent bool
+	IsValue    bool
 
 	Name Name
 
@@ -1310,7 +1372,7 @@ func (s *Struct) MakeZeroValue(imp importer) string {
 }
 
 func (s *Struct) MakeZeroValueCheck(imp importer, v string) string {
-	return ""
+	return fmt.Sprintf("%s.IsZero()", v)
 }
 
 func (s *Struct) TypeName() Name {
