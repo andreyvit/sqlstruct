@@ -7,11 +7,13 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
-	"golang.org/x/tools/go/packages"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/fatih/structtag"
 )
@@ -127,6 +129,25 @@ func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error 
 	defer func() {
 		g.currentInPkgName = ""
 	}()
+
+	ourFile := &File{
+		imports: make(map[string]string),
+	}
+	for _, imp := range file.Imports {
+		importedPath, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return fmt.Errorf("cannot process import of imp.Path.Value: %w", err)
+		}
+		var alias string
+		if imp.Name == nil || imp.Name.Name == "." {
+			alias = path.Base(importedPath)
+		} else {
+			alias = imp.Name.Name
+		}
+		ourFile.imports[alias] = importedPath
+	}
+	// log.Printf("*** imports in %v: %#v", file.Name.Name, ourFile.imports)
+
 	var err error
 	for _, d := range file.Decls {
 		if fn, ok := d.(*ast.FuncDecl); ok {
@@ -139,7 +160,7 @@ func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error 
 						name := Name{pkgPath, ts.Name.Name}
 						if stru, ok := ts.Type.(*ast.StructType); ok {
 							if pass == 1 {
-								err = g.preprocessStruct(ts, name, stru)
+								err = g.preprocessStruct(ourFile, ts, name, stru)
 							} else {
 								err = g.processStruct(ts, name, stru)
 							}
@@ -148,7 +169,7 @@ func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error 
 							}
 						} else {
 							if pass == 1 {
-								alias, err := g.resolveType(ts.Type)
+								alias, err := g.resolveType(ts.Type, ourFile)
 								if err == nil {
 									err = g.processAliasTypeDef(ts, name, alias)
 								} else {
@@ -248,9 +269,10 @@ func (g *generator) processUnknownTypeDef(ts *ast.TypeSpec, name Name) error {
 	return nil
 }
 
-func (g *generator) preprocessStruct(ts *ast.TypeSpec, structName Name, stru *ast.StructType) error {
+func (g *generator) preprocessStruct(file *File, ts *ast.TypeSpec, structName Name, stru *ast.StructType) error {
 	s := &Struct{
 		Name: structName,
+		File: file,
 	}
 
 	if ts.Comment != nil {
@@ -434,7 +456,7 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 		return nil
 	}
 
-	typ, err := g.resolveType(field.Type)
+	typ, err := g.resolveType(field.Type, s.File)
 	if err != nil {
 		return fmt.Errorf("%s.%s: %w", s.Name, name, err)
 	}
@@ -567,7 +589,7 @@ func makeSafeTempName(ident string) string {
 	}
 }
 
-func (g *generator) resolveType(t ast.Expr) (Type, error) {
+func (g *generator) resolveType(t ast.Expr, file *File) (Type, error) {
 	switch v := t.(type) {
 	case *ast.Ident:
 		name := Name{"", v.Name}
@@ -575,13 +597,17 @@ func (g *generator) resolveType(t ast.Expr) (Type, error) {
 	case *ast.SelectorExpr:
 		switch v1 := v.X.(type) {
 		case *ast.Ident:
-			name := Name{v1.Name, v.Sel.Name}
-			return g.resolveTypeName(name)
+			if imported := file.imports[v1.Name]; imported != "" {
+				name := Name{imported, v.Sel.Name}
+				return g.resolveTypeName(name)
+			} else {
+				return &UnknownType{v1.Name, v.Sel.Name}, fmt.Errorf("unknown import %#v", v1.Name)
+			}
 		default:
 			return &UnknownType{"!unknown", v.Sel.Name}, fmt.Errorf("unknown selector expr %#v", v.X)
 		}
 	case *ast.StarExpr:
-		typ, err := g.resolveType(v.X)
+		typ, err := g.resolveType(v.X, file)
 		if err != nil {
 			return &UnknownType{"!unknown", "unknown"}, err
 		}
@@ -1344,11 +1370,16 @@ func (t PtrType) TypeName() Name {
 	panic("no type name of ptr type")
 }
 
+type File struct {
+	imports map[string]string
+}
+
 type Struct struct {
 	Persistent bool
 	IsValue    bool
 
 	Name Name
+	File *File
 
 	TableName      string
 	TableNameConst string
