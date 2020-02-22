@@ -214,6 +214,7 @@ func (g *generator) finalizeAndGenerateCode() ([]byte, error) {
 func (g *generator) initBuiltInTypes() {
 	i64 := g.addType(&WellKnownPrimitive{Name: Name{"", "int64"}, ZeroValue: "0"})
 	i := g.addType(&WellKnownPrimitive{Name: Name{"", "int"}, ZeroValue: "0"})
+	f64 := g.addType(&WellKnownPrimitive{Name: Name{"", "float64"}, ZeroValue: "0.0"})
 	s := g.addType(&WellKnownPrimitive{Name: Name{"", "string"}, ZeroValue: `""`})
 	g.addType(&WellKnownPrimitive{Name: Name{"", "bool"}, ZeroValue: "false"})
 	tm := g.addType(&WellKnownStruct{Name: Name{"time", "Time"}, IsZeroMethod: "IsZero", EqualMethod: "Equal"})
@@ -230,6 +231,10 @@ func (g *generator) initBuiltInTypes() {
 	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullTime"}})
 	nullwr = &NullWrapping{Type: nullt, ValueType: tm, ValueField: "Time", ValidField: "Valid", Next: directAssignment{}}
 	g.nullStrategies[tm.TypeName().FQN()] = nullwr
+
+	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullFloat64"}})
+	nullwr = &NullWrapping{Type: nullt, ValueType: f64, ValueField: "Float64", ValidField: "Valid", Next: directAssignment{}}
+	g.nullStrategies[f64.TypeName().FQN()] = nullwr
 
 }
 
@@ -301,6 +306,8 @@ func (g *generator) preprocessStruct(file *File, ts *ast.TypeSpec, structName Na
 					s.PluralIdent = g.pubOrUnpub(fields[1])
 				case "db:table":
 					s.TableName = fields[1]
+				case "db:skip":
+					s.Skipped = true
 				case "db:facet":
 					//
 				case "db:select_by":
@@ -380,10 +387,16 @@ func (g *generator) processStruct(ts *ast.TypeSpec, structName Name, stru *ast.S
 }
 
 func (g *generator) finalizeStructWithoutRefs(s *Struct) {
-	s.Persistent = (len(s.Cols) > 0)
+	s.Persistent = (len(s.Cols) > 0) && !s.Skipped
 	if !s.Persistent {
 		return
 	}
+}
+
+func (g *generator) finalizeStructWithRefs(s *Struct) {
+	g.resolveEmbeds(s)
+
+	s.TableNameConst = g.pubOrUnpub(s.PluralIdent + "Table")
 
 	for _, col := range s.Cols {
 		col.AddFacet(g.lookupFacet("all"))
@@ -393,12 +406,6 @@ func (g *generator) finalizeStructWithoutRefs(s *Struct) {
 			col.AddFacet(g.lookupFacet("mutable"))
 		}
 	}
-}
-
-func (g *generator) finalizeStructWithRefs(s *Struct) {
-	g.resolveEmbeds(s)
-
-	s.TableNameConst = g.pubOrUnpub(s.PluralIdent + "Table")
 
 	for i, col := range s.Cols {
 		col.IndexInStruct = i
@@ -535,6 +542,8 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 		g.addCol(s, col)
 	} else {
 		embedding.Facets = col.Facets
+		embedding.Nullable = col.Nullable
+		embedding.Immutable = col.Immutable
 		s.Embeddings = append(s.Embeddings, embedding)
 		g.log.Printf("field %s embeds %s", name, embedding.Struct.Name)
 	}
@@ -554,8 +563,9 @@ func (g *generator) resolveEmbeds(s *Struct) {
 }
 
 func (g *generator) processEmbedding(s *Struct, embedding *Embedding) {
+	g.resolveEmbeds(embedding.Struct)
+
 	for _, ecol := range embedding.Struct.Cols {
-		g.resolveEmbeds(embedding.Struct)
 		col := &Col{
 			DBName:      embedding.DBPrefix + ecol.DBName,
 			FieldName:   embedding.FieldName + "." + ecol.FieldName,
@@ -563,8 +573,8 @@ func (g *generator) processEmbedding(s *Struct, embedding *Embedding) {
 			Type:        ecol.Type,
 			TempVarName: unpublishedName(embedding.FieldName + publishedName(ecol.TempVarName)),
 
-			Nullable:      ecol.Nullable,
-			Immutable:     ecol.Immutable,
+			Nullable:      ecol.Nullable || embedding.Nullable,
+			Immutable:     ecol.Immutable || embedding.Immutable,
 			InsertDefault: ecol.InsertDefault,
 		}
 		for _, fct := range embedding.Facets {
@@ -1377,6 +1387,7 @@ type File struct {
 type Struct struct {
 	Persistent bool
 	IsValue    bool
+	Skipped    bool
 
 	Name Name
 	File *File
@@ -1455,6 +1466,8 @@ type Embedding struct {
 	Struct    *Struct
 	Cols      []*Col
 	DBPrefix  string
+	Nullable  bool
+	Immutable bool
 }
 
 type Name struct {
