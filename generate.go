@@ -151,7 +151,8 @@ func (g *generator) processFile(file *ast.File, pkgPath string, pass int) error 
 	var err error
 	for _, d := range file.Decls {
 		if fn, ok := d.(*ast.FuncDecl); ok {
-			g.log.Printf("Func %s", fn.Name.Name)
+			_ = fn
+			// g.log.Printf("Func %s", fn.Name.Name)
 		} else if decl, ok := d.(*ast.GenDecl); ok {
 			switch decl.Tok {
 			case token.TYPE:
@@ -263,13 +264,13 @@ func (g *generator) makeStructIdent(s *Struct, prefix, suffix string, plural boo
 }
 
 func (g *generator) processAliasTypeDef(ts *ast.TypeSpec, name Name, aliasOf Type) error {
-	g.log.Printf("type %v is an alias of %v", name, aliasOf)
+	// g.log.Printf("type %v is an alias of %v", name, aliasOf)
 	g.addType(&AliasType{name, aliasOf})
 	return nil
 }
 
 func (g *generator) processUnknownTypeDef(ts *ast.TypeSpec, name Name) error {
-	g.log.Printf("type %v not a struct", name)
+	// g.log.Printf("type %v not a struct", name)
 	g.addType(&UnsupportedType{name})
 	return nil
 }
@@ -318,7 +319,7 @@ func (g *generator) preprocessStruct(file *File, ts *ast.TypeSpec, structName Na
 					return fmt.Errorf("invalid struct %s DB comment line %q", s.Name, line)
 				}
 			}
-			g.log.Printf("******* comment for %s: %q", s.Name, comment.Text)
+			// g.log.Printf("******* comment for %s: %q", s.Name, comment.Text)
 		}
 		// panic("XXX")
 	}
@@ -347,7 +348,7 @@ func (g *generator) processStruct(ts *ast.TypeSpec, structName Name, stru *ast.S
 	}
 	s := structType.(*Struct)
 
-	g.log.Printf("type %s struct", s.Name.Ident)
+	// g.log.Printf("type %s struct", s.Name.Ident)
 	for _, field := range stru.Fields.List {
 		if field.Names == nil {
 			err := g.processField(s, field, "")
@@ -545,7 +546,7 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 		embedding.Nullable = col.Nullable
 		embedding.Immutable = col.Immutable
 		s.Embeddings = append(s.Embeddings, embedding)
-		g.log.Printf("field %s embeds %s", name, embedding.Struct.Name)
+		// g.log.Printf("field %s embeds %s", name, embedding.Struct.Name)
 	}
 
 	return nil
@@ -586,7 +587,7 @@ func (g *generator) processEmbedding(s *Struct, embedding *Embedding) {
 
 func (g *generator) addCol(s *Struct, col *Col) {
 	s.Cols = append(s.Cols, col)
-	g.log.Printf("%v.%s type %v", s.Name, col.FieldName, col.Type)
+	// g.log.Printf("%v.%s type %v", s.Name, col.FieldName, col.Type)
 }
 
 func makeSafeTempName(ident string) string {
