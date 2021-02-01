@@ -647,7 +647,8 @@ func (g *generator) resolveTypeName(n Name) (Type, error) {
 				return t, nil
 			}
 		}
-		g.log.Printf("Cannot resolve %v, known types are %+v", n, g.types)
+		g.log.Printf("Cannot resolve %v", n)
+		// g.log.Printf("Cannot resolve %v, known types are %+v", n, g.types)
 		return UnknownType(n), fmt.Errorf("unknown type %s", fqn)
 	}
 }
