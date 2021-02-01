@@ -214,8 +214,17 @@ func (g *generator) finalizeAndGenerateCode() ([]byte, error) {
 
 func (g *generator) initBuiltInTypes() {
 	i64 := g.addType(&WellKnownPrimitive{Name: Name{"", "int64"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "int32"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "int16"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "int8"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "uint64"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "uint32"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "uint16"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "uint8"}, ZeroValue: "0"})
 	i := g.addType(&WellKnownPrimitive{Name: Name{"", "int"}, ZeroValue: "0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "uint"}, ZeroValue: "0"})
 	f64 := g.addType(&WellKnownPrimitive{Name: Name{"", "float64"}, ZeroValue: "0.0"})
+	_ = g.addType(&WellKnownPrimitive{Name: Name{"", "float32"}, ZeroValue: "0.0"})
 	s := g.addType(&WellKnownPrimitive{Name: Name{"", "string"}, ZeroValue: `""`})
 	g.addType(&WellKnownPrimitive{Name: Name{"", "bool"}, ZeroValue: "false"})
 	tm := g.addType(&WellKnownStruct{Name: Name{"time", "Time"}, IsZeroMethod: "IsZero", EqualMethod: "Equal"})
