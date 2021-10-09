@@ -409,10 +409,13 @@ func (g *generator) finalizeStructWithRefs(s *Struct) {
 	s.TableNameConst = g.pubOrUnpub(s.PluralIdent + "Table")
 
 	for _, col := range s.Cols {
-		col.AddFacet(g.lookupFacet("all"))
+		col.AddFacet(g.lookupFacet("allall"))
+		if !col.ExcludeFromAll {
+			col.AddFacet(g.lookupFacet("all"))
+		}
 		if col.Immutable {
 			col.AddFacet(g.lookupFacet("immutable"))
-		} else {
+		} else if !col.ReadOnly {
 			col.AddFacet(g.lookupFacet("mutable"))
 		}
 	}
@@ -523,6 +526,10 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 				col.Nullable = true
 			case "immutable":
 				col.Immutable = true
+			case "readonly":
+				col.ReadOnly = true
+			case "extra":
+				col.ExcludeFromAll = true
 			case "pk":
 				col.Immutable = true
 				col.AddFacet(g.lookupFacet("pk"))
@@ -542,10 +549,12 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 		}
 	}
 
-	if col.InsertDefault {
-		col.AddFacet(g.lookupFacet("insertDefaults"))
-	} else {
-		col.AddFacet(g.lookupFacet("insert"))
+	if !col.ReadOnly {
+		if col.InsertDefault {
+			col.AddFacet(g.lookupFacet("insertDefaults"))
+		} else {
+			col.AddFacet(g.lookupFacet("insert"))
+		}
 	}
 
 	if embedding == nil {
@@ -1026,7 +1035,7 @@ func (g *generator) generateStructSelectMany(cg *codeGen, s *Struct, fns *funcNa
 	cg.Printf("\t}\n")
 	cg.Printf("\tresult, err := %s(rows, fct)\n", fns.scanMult)
 	cg.Printf("\tif logger, ok := ex.(%s); ok && logger.IsLoggingQueryResults() {\n", g.queryResultLoggerInterface)
-	cg.Printf("\t\tlogger.LogQueryResult(ctx, %q, query, args, start, len(result), err, result)\n", fns.selectOne)
+	cg.Printf("\t\tlogger.LogQueryResult(ctx, %q, query, args, start, len(result), err, result)\n", fns.selectMany)
 	cg.Printf("\t}\n")
 	cg.Printf("\treturn result, err\n")
 	cg.Printf("}\n\n")
@@ -1468,9 +1477,11 @@ type Col struct {
 	TempVarName string
 	CodingStg   CodingStrategy
 
-	Nullable      bool
-	Immutable     bool
-	InsertDefault bool
+	ReadOnly       bool
+	ExcludeFromAll bool
+	Nullable       bool
+	Immutable      bool
+	InsertDefault  bool
 }
 
 func (c *Col) HasFacet(f *Facet) bool {
