@@ -229,20 +229,20 @@ func (g *generator) initBuiltInTypes() {
 	g.addType(&WellKnownPrimitive{Name: Name{"", "bool"}, ZeroValue: "false"})
 	tm := g.addType(&WellKnownStruct{Name: Name{"time", "Time"}, IsZeroMethod: "IsZero", EqualMethod: "Equal"})
 
-	nullt := g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullString"}})
+	nullt := g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullString"}, ValidField: "Valid"})
 	nullwr := &NullWrapping{Type: nullt, ValueType: s, ValueField: "String", ValidField: "Valid", Next: directAssignment{}}
 	g.nullStrategies[s.TypeName().FQN()] = nullwr
 
-	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullInt64"}})
+	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullInt64"}, ValidField: "Valid"})
 	nullwr = &NullWrapping{Type: nullt, ValueType: i64, ValueField: "Int64", ValidField: "Valid", Next: directAssignment{}}
 	g.nullStrategies[i64.TypeName().FQN()] = nullwr
 	g.nullStrategies[i.TypeName().FQN()] = nullwr
 
-	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullTime"}})
+	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullTime"}, ValidField: "Valid"})
 	nullwr = &NullWrapping{Type: nullt, ValueType: tm, ValueField: "Time", ValidField: "Valid", Next: directAssignment{}}
 	g.nullStrategies[tm.TypeName().FQN()] = nullwr
 
-	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullFloat64"}})
+	nullt = g.addType(&WellKnownStruct{Name: Name{databaseSQL, "NullFloat64"}, ValidField: "Valid"})
 	nullwr = &NullWrapping{Type: nullt, ValueType: f64, ValueField: "Float64", ValidField: "Valid", Next: directAssignment{}}
 	g.nullStrategies[f64.TypeName().FQN()] = nullwr
 
@@ -444,16 +444,21 @@ func makeIdentFromFieldName(fn string) string {
 }
 
 func (g *generator) decideCodingStrategy(s *Struct, col *Col) CodingStrategy {
-	if col.Nullable && !isInherentlyNullable(col.Type) {
-		stg := g.nullStrategies[col.Type.TypeName().FQN()]
-		if stg == nil {
-			stg = PtrWrapping{col.Type, directAssignment{}}
-			// panic(fmt.Sprintf("cannot make %s nullable, TODO impl ptr strategy", col.Type.TypeName().FQN()))
-		}
-		return stg
-	} else {
+	if !col.Nullable {
 		return directAssignment{}
 	}
+	if col.NullableStrategy != nil {
+		return col.NullableStrategy
+	}
+	if isInherentlyNullable(col.Type) {
+		return directAssignment{}
+	}
+	stg := g.nullStrategies[col.Type.TypeName().FQN()]
+	if stg == nil {
+		stg = PtrWrapping{col.Type, directAssignment{}}
+		// panic(fmt.Sprintf("cannot make %s nullable, TODO impl ptr strategy", col.Type.TypeName().FQN()))
+	}
+	return stg
 }
 
 func (g *generator) processField(s *Struct, field *ast.Field, name string) error {
@@ -516,6 +521,14 @@ func (g *generator) processField(s *Struct, field *ast.Field, name string) error
 					// TODO: insert NOW()
 				default:
 					return fmt.Errorf("%s.%s tag option %q has invalid value %q", s.Name, col.FieldName, opt, val)
+				}
+			case "null_magic":
+				subvals := strings.Split(val, ":")
+				switch subvals[0] {
+				case "none":
+					col.NullableStrategy = directAssignment{}
+				default:
+					return fmt.Errorf("%s.%s tag option %q specifies invalid strategy %q", s.Name, col.FieldName, opt, subvals[0])
 				}
 			default:
 				return fmt.Errorf("%s.%s tag has invalid option %q:%q", s.Name, col.FieldName, opt, val)
@@ -592,9 +605,10 @@ func (g *generator) processEmbedding(s *Struct, embedding *Embedding) {
 			Type:        ecol.Type,
 			TempVarName: unpublishedName(embedding.FieldName + publishedName(ecol.TempVarName)),
 
-			Nullable:      ecol.Nullable || embedding.Nullable,
-			Immutable:     ecol.Immutable || embedding.Immutable,
-			InsertDefault: ecol.InsertDefault,
+			Nullable:         ecol.Nullable || embedding.Nullable,
+			NullableStrategy: ecol.NullableStrategy,
+			Immutable:        ecol.Immutable || embedding.Immutable,
+			InsertDefault:    ecol.InsertDefault,
 		}
 		for _, fct := range embedding.Facets {
 			col.AddFacet(fct)
@@ -1365,6 +1379,7 @@ type WellKnownStruct struct {
 	Name Name
 
 	IsZeroMethod string
+	ValidField   string
 	EqualMethod  string
 }
 
@@ -1379,6 +1394,8 @@ func (t WellKnownStruct) MakeZeroValue(imp importer) string {
 func (t WellKnownStruct) MakeZeroValueCheck(imp importer, v string) string {
 	if t.IsZeroMethod != "" {
 		return fmt.Sprintf("%s.%s()", v, t.IsZeroMethod)
+	} else if t.ValidField != "" {
+		return fmt.Sprintf("!%s.%s", v, t.ValidField)
 	}
 	return ""
 }
@@ -1477,11 +1494,12 @@ type Col struct {
 	TempVarName string
 	CodingStg   CodingStrategy
 
-	ReadOnly       bool
-	ExcludeFromAll bool
-	Nullable       bool
-	Immutable      bool
-	InsertDefault  bool
+	ReadOnly         bool
+	ExcludeFromAll   bool
+	Nullable         bool
+	NullableStrategy CodingStrategy
+	Immutable        bool
+	InsertDefault    bool
 }
 
 func (c *Col) HasFacet(f *Facet) bool {
