@@ -1288,7 +1288,9 @@ func (e PtrWrapping) makeEncoder(imp importer, src string, temp string, col *Col
 
 	check := e.Type.MakeZeroValueCheck(imp, src)
 	if check == "" {
-		check = fmt.Sprintf("/* type %s does not support zero value checking */", e.Type.TypeName())
+		zeroName := temp + "ZeroVal"
+		we.Before = append(we.Before, fmt.Sprintf("var %s %s", zeroName, imp.qualified(e.Type.TypeName())))
+		check = fmt.Sprintf("%s == %s", src, zeroName)
 	}
 
 	we.Before = append(we.Before, fmt.Sprintf("if !(%s) {", check))
