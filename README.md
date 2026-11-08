@@ -1,4 +1,6 @@
-# Use Go structs with `database/sql`
+# Generate Go helpers for `database/sql`
+
+`sqlstruct` is a code generator. It reads tagged Go structs and generates ordinary Go functions for SQL building, execution and scanning.
 
 Two goals:
 
@@ -15,7 +17,7 @@ Principles:
 
 Installation:
 
-    go get -u github.com/andreyvit/sqlstruct/cmd/sqlstruct
+    go install github.com/andreyvit/sqlstruct/cmd/sqlstruct@latest
 
 ## Example
 
@@ -33,6 +35,35 @@ type Post struct {
     Body  string `db:"description"`
 }
 ```
+
+Save the struct in a `model` package (with `import "time"`). From your application module, generate a separate database package:
+
+```sh
+mkdir -p db
+sqlstruct -in ./model -pkg db -out db/generated.go
+```
+
+Run the command again whenever the tagged structs change; commit the generated file with your application. The default generated helpers are unexported, so call them from the generated `db` package. Use `-pub` to export them instead.
+
+For example, add this function to the same `db` package after generation (replace `example.com/myapp/model` with your module’s path):
+
+```go
+package db
+
+import (
+	"context"
+	"database/sql"
+	"example.com/myapp/model"
+
+	"github.com/andreyvit/sqlexpr"
+)
+
+func FindPost(ctx context.Context, conn *sql.DB, id int64) (*model.Post, error) {
+	return fetchPost(ctx, conn, allFacet, sqlexpr.Eq(sqlexpr.Column("id"), id), nil)
+}
+```
+
+The caller opens the database with its chosen driver and handles the returned error. SQL generation defaults to PostgreSQL through `sqlexpr`; choose its dialect before building queries.
 
 Generates scanning functions that `.Scan` into this struct:
 
@@ -63,8 +94,8 @@ func addPostConditions(s sqlexpr.Whereable, v *model.Post, fct facet)
 And generates execution functions that tie all the above together: they generate a statement, call a callback to customize it, then execute it via `sqlexpr.Executor` (which is an interface that `*sql.DB` and `*sql.Tx` conform to), then scan the results:
 
 ```go
-func fetchPost(ctx context.Context, ex sqlexpr.Executor, fct facet, f func(*sqlexpr.Select)) (*model.Post, error)
-func fetchPosts(ctx context.Context, ex sqlexpr.Executor, fct facet, f func(*sqlexpr.Select)) ([]*model.Post, error)
+func fetchPost(ctx context.Context, ex sqlexpr.Executor, fct facet, where sqlexpr.Expr, f func(*sqlexpr.Select)) (*model.Post, error)
+func fetchPosts(ctx context.Context, ex sqlexpr.Executor, fct facet, where sqlexpr.Expr, f func(*sqlexpr.Select)) ([]*model.Post, error)
 func insertPost(ctx context.Context, ex sqlexpr.Executor, v *model.Post, setFct, retFct facet, f func(*sqlexpr.Insert)) error
 func updatePost(ctx context.Context, ex sqlexpr.Executor, v *model.Post, condFct, updateFct, retFct facet, f func(*sqlexpr.Update)) error
 func deletePost(ctx context.Context, ex sqlexpr.Executor, v *model.Post, condFct facet, f func(*sqlexpr.Delete)) error
